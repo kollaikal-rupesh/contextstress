@@ -1,0 +1,13 @@
+.env
+__pycache__/
+*.pyc
+results/
+.DS_Store
+.claude/
+*.tar.gz
+peer_review_report.md
+research_paper.md
+research_pipeline_audit.md
+knowledge_synthesis_attention_limits.md
+generate_figures.py
+generate_figures_v2.py

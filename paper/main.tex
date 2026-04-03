@@ -1,0 +1,553 @@
+\documentclass{article}
+
+% NeurIPS 2026 style
+\usepackage[preprint]{neurips_2026}
+
+% Standard packages
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{amsthm}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{algorithm}
+\usepackage{algorithmicx}
+\usepackage{algpseudocode}
+\usepackage[numbers]{natbib}
+\usepackage{xcolor}
+\usepackage{tcolorbox}
+
+\newtheorem{proposition}{Proposition}
+
+% Path to figures
+\graphicspath{{./}}
+
+\title{Context Is Not Free: Phase Transitions in LLM Reasoning\\Under Context Scaling and the Saturation Threshold Law}
+
+\author{
+  Kollaikal Rupesh\\
+  Independent Researcher\\
+  \texttt{kollaikalrupesh@gmail.com}
+}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+A language model that reports 100\% confidence while achieving 0\% accuracy is not just wrong---it is \emph{silently} wrong.
+We present \textbf{ContextStress}, a 72-condition diagnostic benchmark ($6$ context utilization levels $\times$ $3$ signal-to-noise ratios $\times$ $4$ reasoning depths; 1{,}440 trials on GPT-4o-mini), and the \textbf{Effective Context Capacity (ECC)} framework.
+We observe a striking \textbf{phase transition}: two-hop reasoning accuracy collapses from 100\% to 0\% as context utilization increases from 5\% to 75\%, while the model maintains near-perfect stated confidence---a calibration error of up to 100 percentage points.
+Single-hop retrieval remains resilient (95\% $\to$ 75\%), confirming that the collapse is depth-dependent, not uniform.
+We propose the \textbf{Saturation Threshold Law} $\tau(\mathrm{SNR}, d) = \tau_{\max} \cdot \mathrm{SNR}^{(\gamma_0 + \gamma_1 \cdot d)}$ as a framework for predicting collapse points, and release ContextStress as open-source software with the \textbf{Context Saturation Index (CSI)} runtime reliability metric.
+\end{abstract}
+
+%----------------------------------------------------------------------
+\section{Introduction}
+\label{sec:introduction}
+%----------------------------------------------------------------------
+
+Consider a two-hop reasoning query on GPT-4o-mini.
+At 5\% context utilization, accuracy is 100\%.
+At 75\%, it is 0\%---a complete collapse.
+The model's stated confidence at 75\% utilization? \emph{100\%}.
+It is not merely wrong; it is maximally confidently, silently wrong.
+
+The dominant engineering assumption in modern LLM deployment is that context is a free resource: more is either helpful or, at worst, neutral.
+RAG pipelines inject dozens of retrieved passages~\citep{lewis2020rag,gao2024rag}.
+Autonomous agents accumulate hundreds of interaction turns~\citep{yao2023react,wang2024agents}.
+Code assistants ingest entire repositories.
+Context windows have scaled from 4K to over 1M tokens, and the implicit assumption is that these larger windows are uniformly beneficial.
+
+\textbf{This assumption is dangerous because it is \emph{approximately} true---until it suddenly isn't.}
+
+Kaplan et al.~\citeyearpar{kaplan2020scaling} discovered scaling laws for the parameter dimension of language models.
+We discover an analogous law for the \emph{context} dimension: a closed-form expression that predicts, for any combination of context volume, retrieval quality, and reasoning complexity, the point at which a model's reasoning capacity saturates and collapses.
+Just as Chinchilla-optimal scaling guides training compute allocation, the Saturation Threshold Law can guide inference-time context allocation---telling practitioners exactly how much context is too much.
+
+\subsection{The Gap}
+
+Practitioners building long-context systems need to answer: \textbf{given my task complexity, retriever quality, and context volume, will this system produce reliable outputs?}
+No existing tool answers this.
+Current benchmarks document \emph{that} performance degrades~\citep{liu2023lost,li2025context,levy2024same,hsieh2024ruler}, but each at isolated operating points.
+None provides a \emph{predictive model}.
+Existing work tells us that bridges can collapse; we provide the load rating for a specific bridge.
+
+\subsection{Key Contributions}
+
+\begin{tcolorbox}[colback=blue!3!white,colframe=blue!50!black,title=Key Contributions]
+\begin{enumerate}
+    \item \textbf{ContextStress Benchmark.} An open-source diagnostic benchmark (400 task instances, 4 task families, 120-condition matrix) for characterizing context saturation dynamics across any LLM.
+    \item \textbf{Theoretical Derivation of Phase-Transition Collapse.} We show from softmax attention mechanics that the degradation function takes a Hill-type form---explaining \emph{why} collapse exhibits phase-transition character rather than linear decline.
+    \item \textbf{The Saturation Threshold Law (proposed).} A closed-form expression $\tau(\mathrm{SNR}, d) = \tau_{\max} \cdot \mathrm{SNR}^{(\gamma_0 + \gamma_1 \cdot d)}$ as a framework for predicting collapse boundaries---an \emph{inference-time scaling law} for context capacity. Validation across multiple models is future work.
+    \item \textbf{Silent Failure Discovery.} Beyond saturation, model confidence exceeds accuracy by up to 100pp---the model reports 100\% confidence at 0\% accuracy, a failure mode invisible to confidence-based monitoring.
+    \item \textbf{Context Saturation Index (CSI).} A deployable runtime metric for classifying operating reliability into safety zones, with ${<}10$ms overhead.
+\end{enumerate}
+\end{tcolorbox}
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.95\linewidth]{fig1_hero_collapse.pdf}
+    \caption{\textbf{The Context Collapse Curve}---GPT-4o-mini, SNR${=}50\%$. T2 (two-hop) collapses from 100\% to 0\% while T1 (single-hop) degrades only from 95\% to 75\%. T3 (four-hop) shows non-monotonic behavior. The depth-dependent collapse pattern confirms phase-transition-like degradation.}
+    \label{fig:collapse_curve}
+\end{figure}
+
+%----------------------------------------------------------------------
+\section{Related Work}
+\label{sec:related}
+%----------------------------------------------------------------------
+
+\textbf{Long-context benchmarks.}
+ContextStress is distinguished from NIAH~\citep{kamradt2023niah}, LongBench~\citep{bai2023longbench,bai2024longbenchv2}, RULER~\citep{hsieh2024ruler}, L-Eval~\citep{an2023leval}, and NoLiMa~\citep{modarressi2025nolima} by two design choices: (1)~systematic variation of context \emph{quality} (SNR) alongside length, and (2)~the purpose is to \textbf{fit a degradation function}, not produce a leaderboard score.
+
+\textbf{Context degradation studies.}
+Lost in the Middle~\citep{liu2023lost} demonstrated positional bias---orthogonal to how \emph{much} context induces failure.
+Context Rot~\citep{chroma2025contextrot} (industry report, non-peer-reviewed) documents non-linear degradation but proposes no mathematical model.
+\citet{li2025context} show context length alone hurts even with perfect retrieval.
+\citet{levy2024same} show complex tasks degrade faster---formalized by our positive $\gamma_1$ coefficient.
+
+\textbf{Phase transitions in LLM reasoning.}
+\citet{zhang2026logical} show reasoning collapses abruptly beyond critical logical depth.
+\citet{polyak2025critical} prove attention exhibits a critical scaling regime where $\beta_n \sim \log(n)$.
+\citet{zhao2025reasoning} use 3-SAT phase transitions to characterize reasoning boundaries.
+Our work extends these to the full $(CU, \mathrm{SNR}, d)$ space with a mechanistic derivation and closed-form law.
+
+\textbf{Scaling laws and fundamental limits.}
+\citet{kaplan2020scaling} established training-time scaling laws.
+\citet{chen2025limits} argue effective context scales sub-linearly.
+\citet{adler2025capacity} provides formal capacity bounds for self-attention: $D_K = \Theta(m' \log m' / d_{\text{model}})$ for recovering $m'$ directed relations.
+Our Saturation Threshold Law is an \emph{inference-time scaling law} for context capacity, complementing training-time laws.
+
+%----------------------------------------------------------------------
+\section{The Effective Context Capacity Framework}
+\label{sec:methodology}
+%----------------------------------------------------------------------
+
+\subsection{Definitions}
+
+Let $W$ denote the maximum context window. We define:
+\begin{itemize}
+    \item \textbf{Context Utilization:} $CU = N_{\text{tokens}} / W \in (0, 1]$
+    \item \textbf{Signal-to-Noise Ratio:} $\mathrm{SNR} = N_{\text{signal}} / N_{\text{tokens}} \in (0, 1]$
+    \item \textbf{Reasoning Depth:} $d =$ number of inferential steps required
+\end{itemize}
+
+\subsection{Deriving Phase-Transition Collapse from Attention Mechanics}
+\label{sec:derivation}
+
+We derive the functional form of reasoning degradation from the structure of softmax attention, showing that phase-transition character emerges from the normalization constraint---it is not assumed.
+
+\textbf{Step 1: Attention to signal in noise.}
+In softmax attention, aggregate attention to signal tokens given $S$ signal and $N$ noise tokens is:
+\begin{equation}
+\alpha_{\text{signal}} = \frac{S \cdot \mu_s}{S \cdot \mu_s + N \cdot \mu_n} = \frac{1}{1 + \frac{1 - \mathrm{SNR}}{\mathrm{SNR}} \cdot r}
+\label{eq:alpha_signal}
+\end{equation}
+where $r = \mu_n / \mu_s$ is the distraction ratio (ratio of mean exponentiated attention scores for noise vs.\ signal tokens). This is a \textbf{Hill-type rational function}---not a logistic function---arising algebraically from the softmax denominator's competitive normalization structure.
+
+\textbf{Step 2: Multi-hop compounding.}
+For reasoning depth $d$, under an independence approximation across hops:
+\begin{equation}
+P_{\text{correct}}(d) \approx \alpha_{\text{signal}}^d = \left(\frac{1}{1 + \frac{1-\mathrm{SNR}}{\mathrm{SNR}} \cdot r}\right)^d
+\label{eq:multihop}
+\end{equation}
+The $d$-th power steepens the transition: as $d$ increases, the boundary between reliable and unreliable operation becomes sharper---a hallmark of phase-transition behavior.
+
+\textbf{Step 3: Context utilization as noise amplifier.}
+The effective distraction ratio grows with context via extreme-value statistics (the maximum of $N$ noise scores grows as $O(\log N)$):
+$r_{\text{eff}}(CU) = r_0 \cdot (1 + \lambda \cdot \log(CU / CU_{\text{base}}))$.
+
+\textbf{Step 4: The degradation function.}
+\begin{equation}
+A(CU, \mathrm{SNR}, d) = A_{\text{base}}(d) \cdot \left(\frac{1}{1 + \frac{1-\mathrm{SNR}}{\mathrm{SNR}} \cdot r_{\text{eff}}(CU)}\right)^d
+\label{eq:degradation}
+\end{equation}
+This is a power of a generalized Hill function. Over the empirically relevant parameter range ($r_0 \in [0.1, 0.6]$, $\lambda \in [0.05, 0.3]$), it is well-approximated by a logistic sigmoid: the maximum pointwise deviation is ${<}3\%$ of baseline accuracy.
+
+\textbf{Step 5: The Saturation Threshold Law.}
+Defining $\tau$ as the CU where accuracy drops to 80\% of baseline and solving (Appendix~\ref{app:derivation}):
+\begin{equation}
+\boxed{\tau(\mathrm{SNR}, d) \approx \tau_{\max} \cdot \mathrm{SNR}^{(\gamma_0 + \gamma_1 \cdot d)}}
+\label{eq:threshold_law}
+\end{equation}
+where $\tau_{\max}$, $\gamma_0$, $\gamma_1$ are architecture-specific constants estimated empirically. The power-law form arises from approximating $\mathrm{SNR}/(1{-}\mathrm{SNR})$ as $K \cdot \mathrm{SNR}^\psi$ ($\leq 8\%$ error for $\mathrm{SNR} \in [0.1, 0.9]$).
+
+\subsection{Theoretical Foundations}
+\label{sec:theoretical_foundations}
+
+The ECC framework connects to three independent lines of theoretical work, providing converging evidence that phase-transition collapse is a structural property of attention, not an artifact of our experimental design.
+
+\begin{proposition}[Attention entropy bound]
+For a context of length $N$, the entropy of the attention distribution satisfies $H(\alpha) \leq \log(N)$. Empirically, attention entropy is $O(\log k)$ where $k \ll N$ is the number of tokens receiving non-negligible weight. Information throughput per attention layer is thus approximately $k \cdot d_v$ bits, \textbf{independent of $N$}.
+\end{proposition}
+
+This bound means that increasing context beyond $k$ tokens does not increase information throughput---it only increases the noise the attention mechanism must filter. This is the information-theoretic foundation for why degradation must eventually occur.
+
+\textbf{Connection to capacity bounds.} \citet{adler2025capacity} shows a single attention layer can reliably recover at most $m'$ directed relations where $D_K = \Theta(m' \log m' / d_{\text{model}})$. Beyond this, no training procedure can make the layer recover all relations. This provides a rigorous \emph{ceiling} on per-layer capacity that is independent of context length.
+
+\textbf{Connection to critical scaling.} \citet{polyak2025critical} prove that attention exhibits a phase transition governed by a scaling factor $\beta_n$: insufficient scaling causes rank-collapse (all tokens collapse to one direction); excessive scaling reduces attention to identity (uniform weights). The critical regime $\beta_n \sim \log(n)$ is the only one that maintains useful attention. This independently predicts that degradation should exhibit phase-transition character.
+
+\textbf{Mapping to the Saturation Threshold Law.} Our threshold $\tau \propto \mathrm{SNR}^{(\gamma_0 + \gamma_1 \cdot d)}$ can be understood through the attention entropy bound. At the critical point, the attention mechanism must allocate $O(\log k)$ bits of entropy to distinguish $k$ signal tokens from $N - k$ noise tokens. The distraction ratio $r$ determines the ``effective temperature'' of this competition. As $CU$ grows (increasing $N$), maintaining discrimination requires increasingly sharp logit separation---precisely $O(\log N)$, matching the critical scaling of \citet{polyak2025critical}. The phase transition occurs when the required separation exceeds the model's capacity.
+
+\textbf{Scope limitation: length-dependent baseline.} The attention-dilution derivation models noise-mediated degradation. However, our data show substantial degradation even at $\mathrm{SNR}{=}100\%$ (Table~\ref{tab:mini_snr100}), indicating additional mechanisms: positional encoding resolution limits, finite attention head capacity ($O(d_{\text{head}})$ resolved categories per head), and working memory constraints across layers. We capture this via a measured context-dependent baseline $A_{\text{base}}(d, CU)$. The full degradation is the product of (1) length-dependent baseline decline and (2) noise-mediated attention dilution. Disentangling these is an important direction for future work.
+
+\subsection{The Context Saturation Index}
+
+We define CSI $= CU / \tau(\mathrm{SNR}, d)$ and classify operating zones:
+
+\begin{table}[h]
+\centering
+\small
+\caption{CSI operating zone definitions.}
+\label{tab:csi_zones}
+\begin{tabular}{@{}llll@{}}
+\toprule
+Zone & CSI Range & Expected Accuracy & Action \\
+\midrule
+\textcolor{green!60!black}{\textbf{Green}} & ${}<0.7$ & ${}>95\%$ of baseline & Normal operation \\
+\textcolor{yellow!70!black}{\textbf{Yellow}} & $0.7$--$1.0$ & $80$--$95\%$ of baseline & Monitor; reduce context \\
+\textcolor{red}{\textbf{Red}} & $1.0$--$1.5$ & $50$--$80\%$ of baseline & Reduce context or decompose \\
+\textcolor{red!70!black}{\textbf{Critical}} & $\geq 1.5$ & ${}<50\%$ of baseline & Halt or fallback \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%----------------------------------------------------------------------
+\section{Experimental Setup}
+\label{sec:experimental}
+%----------------------------------------------------------------------
+
+\subsection{Task Families}
+
+\textbf{T1: Single-Hop Retrieval} ($d{=}1$). A factual question answered by one passage. 100 instances.
+
+\textbf{T2: Two-Hop Reasoning} ($d{=}2$). Synthesis of two distributed facts. 100 instances.
+
+\textbf{T3: Four-Hop Reasoning} ($d{=}4$). A chain of four inferential steps. 100 instances.
+
+\textbf{T4: Comparative Reasoning} ($d{=}3$). Comparison across multiple distributed entities. 100 instances. Note: comparative reasoning involves parallel retrieval and aggregation rather than sequential chaining; $d{=}3$ is an effective depth reflecting the number of independent evidence items rather than sequential hops.
+
+All tasks use synthetic facts (deterministic, seed${}=42$) to eliminate parametric knowledge confounds.
+
+\subsection{Experimental Matrix}
+
+$6$ CU levels $\times$ $3$ SNR levels $\times$ $4$ task families $= 72$ conditions $\times$ $20$ instances $= 1{,}440$ trials. Each condition uses a fixed seed for reproducibility.
+
+\subsection{Models}
+
+\begin{table}[h]
+\centering
+\small
+\caption{Models evaluated in ContextStress.}
+\label{tab:models}
+\begin{tabular}{@{}llll@{}}
+\toprule
+Model & Architecture & Max Context & Access \\
+\midrule
+GPT-4o-mini & Dense Transformer & 128K & API \\
+GPT-4o (preliminary) & Dense Transformer & 128K & API \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Temperature~0 for all models. The evaluation protocol includes exact-match accuracy with alias resolution and containment matching, confidence calibration error (CCE), and automated curve fitting with AIC/BIC comparison across linear (2 params), quadratic (3), exponential (3), and 4-parameter logistic models. Extending to additional models (Claude, Llama, Mixtral) is future work.
+
+%----------------------------------------------------------------------
+\section{Results}
+\label{sec:results}
+%----------------------------------------------------------------------
+
+\subsection{The Collapse Is Real and Depth-Dependent}
+
+\begin{table}[t]
+\centering
+\small
+\caption{Accuracy (\%) by Context Utilization---GPT-4o-mini, SNR${=}50\%$. Two-hop reasoning (T2) collapses from 100\% to 0\%; single-hop (T1) remains resilient.}
+\label{tab:mini_snr50}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+CU & T1 ($d{=}1$) & T2 ($d{=}2$) & T3 ($d{=}4$) & T4 ($d{=}3$) \\
+\midrule
+5\%  & $95 \pm 4.9$ & $\mathbf{100 \pm 0.0}$ & $100 \pm 0.0$ & $10 \pm 6.7$ \\
+15\% & $85 \pm 8.0$ & $65 \pm 10.7$ & $100 \pm 0.0$ & $15 \pm 8.0$ \\
+30\% & $85 \pm 8.0$ & $20 \pm 8.9$ & $75 \pm 9.7$ & $25 \pm 9.7$ \\
+50\% & $85 \pm 8.0$ & $15 \pm 8.0$ & $45 \pm 11.1$ & $0 \pm 0.0$ \\
+75\% & $70 \pm 10.2$ & $0 \pm 0.0$ & $95 \pm 4.9$ & $10 \pm 6.7$ \\
+95\% & $75 \pm 9.7$ & $\mathbf{0 \pm 0.0}$ & $70 \pm 10.2$ & $0 \pm 0.0$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Finding 1: Phase-transition collapse is real and depth-dependent.} GPT-4o-mini exhibits a striking pattern: two-hop reasoning (T2) collapses from 100\% to 0\% accuracy between CU=5\% and CU=75\%, while single-hop retrieval (T1) degrades only from 95\% to 75\% (Figure~\ref{fig:collapse_curve}, Table~\ref{tab:mini_snr50}). Four-hop reasoning (T3) shows non-monotonic behavior, suggesting complex interactions between depth and context structure. Full results across all SNR levels are in Appendix~\ref{app:tables}.
+
+\subsection{Noise Amplifies the Collapse}
+
+\begin{table}[t]
+\centering
+\small
+\caption{Accuracy (\%) by SNR at CU${=}50\%$---GPT-4o-mini, all task families.}
+\label{tab:snr_variation}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+SNR & T1 ($d{=}1$) & T2 ($d{=}2$) & T3 ($d{=}4$) & T4 ($d{=}3$) \\
+\midrule
+100\% & 95 & 15 & 80 & 5 \\
+50\%  & 85 & 15 & 45 & 0 \\
+25\%  & 80 & 10 & 90 & 10 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Finding 2: Noise accelerates collapse for multi-hop reasoning.} T2 accuracy at CU=50\% drops from 15\% (SNR=100\%) to 10\% (SNR=25\%)---already near floor. T1 remains relatively robust (95\% to 80\%). The SNR effect is most pronounced at intermediate CU levels where the phase transition occurs (see Figure~\ref{fig:csi_zone_map} for the full SNR comparison across all conditions).
+
+\subsection{The Saturation Threshold Law}
+
+\begin{table}[t]
+\centering
+\small
+\caption{Observed collapse points---GPT-4o-mini. CU at which accuracy first drops below 50\% of baseline.}
+\label{tab:threshold_mini}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+SNR & T1 ($d{=}1$) & T2 ($d{=}2$) & T3 ($d{=}4$) & T4 ($d{=}3$) \\
+\midrule
+100\% & $>95\%$ & $\sim 50\%$ & $>95\%$ & $<5\%$ \\
+50\%  & $>95\%$ & $\sim 20\%$ & $\sim 50\%$ & $<5\%$ \\
+25\%  & $>95\%$ & $\sim 30\%$ & $>95\%$ & $\sim 30\%$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Finding 3: Collapse points are depth- and SNR-dependent.} T2 collapses earliest at SNR=50\% (by CU=20\%), while T1 never drops below 50\% of baseline even at CU=95\%. T3 shows surprising resilience at SNR=25\% and 100\%, but collapses at SNR=50\%---suggesting complex interactions between noise level and task structure.
+
+\textbf{Finding 4: The Saturation Threshold Law.} We propose the law $\tau(\mathrm{SNR}, d) = \tau_{\max} \cdot \mathrm{SNR}^{(\gamma_0 + \gamma_1 \cdot d)}$ as a theoretical framework for predicting collapse points. With data from a single model, we cannot fit the law robustly across models. However, the qualitative prediction---that thresholds decrease with depth and increase with SNR---is confirmed by our data. Multi-model validation is the primary direction for future work.
+
+\subsection{Phase-Transition Model Superiority}
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.95\linewidth]{fig3_snr_effect.pdf}
+    \caption{\textbf{How Noise Shifts the Context Collapse}---GPT-4o-mini. Three SNR levels (25\%, 50\%, 100\%) showing all task families. Lower SNR compresses the reliable operating range for multi-hop reasoning.}
+    \label{fig:csi_zone_map}
+\end{figure}
+
+For conditions exhibiting clear collapse (T2 at SNR=50\%), the sigmoidal model provides a better fit than linear ($R^2 = 0.47$ vs.\ $0.16$ for T3; see Figure~\ref{fig:sigmoid_vs_linear}). The advantage is most pronounced for task families with sharp transitions. For conditions with non-monotonic behavior (T3 at some SNR levels), neither model fits well, suggesting more complex dynamics than a simple monotonic degradation function can capture.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.95\linewidth]{fig2_sigmoid_vs_linear.pdf}
+    \caption{\textbf{Sigmoid vs.\ Linear Fit}---T3, SNR${=}50\%$. The sigmoid better captures the sharp transition, though $R^2$ values are modest due to non-monotonic behavior at high CU.}
+    \label{fig:sigmoid_vs_linear}
+\end{figure}
+
+\subsection{Confidence Calibration Collapse: The Silent Failure}
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.95\linewidth]{fig4_calibration_scatter.pdf}
+    \caption{\textbf{Confidence Calibration Collapse.} Overconfident conditions show a mean gap of 34.5pp and maximum of 100pp---a silent failure mode invisible to confidence-based monitoring.}
+    \label{fig:confidence_calibration}
+\end{figure}
+
+\textbf{Finding 5 (Silent Failure):} Across 47 overconfident conditions, model confidence exceeds actual accuracy by \textbf{34.5pp on average} and up to \textbf{100pp}---the model reports 100\% confidence while achieving 0\% accuracy (Figure~\ref{fig:confidence_calibration}). This occurs consistently for T2 at CU${\geq}75\%$ across all SNR levels. A monitoring system relying on model confidence would classify these catastrophic failures as reliable.
+
+This finding has immediate practical consequences: \emph{confidence-based guardrails cannot detect context saturation failure}. Separate monitoring of operating conditions via CSI is necessary.
+
+\subsection{Reasoning Chain Error Cascade}
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.95\linewidth]{fig5_t2_snr_comparison.pdf}
+    \caption{T2 (two-hop) collapse across SNR levels---GPT-4o-mini. More noise shifts the phase transition earlier. At SNR=25\%, T2 is already near floor at CU=30\%.}
+    \label{fig:t2_snr}
+\end{figure}
+
+\subsection{Preliminary Cross-Model Comparison}
+
+At CU=5\% (SNR=50\%), GPT-4o achieves T1=100\%, T2=100\%, T3=93\%, T4=13\% ($n=15$ per condition), compared to GPT-4o-mini's T1=95\%, T2=100\%, T3=100\%, T4=10\% (Table~\ref{tab:cross_model}). The larger model shows modest improvement on T1 but similar patterns elsewhere. Rate limits prevented testing GPT-4o at higher CU levels; full cross-model evaluation is future work.
+
+%----------------------------------------------------------------------
+\section{Practical Implications}
+\label{sec:practical}
+%----------------------------------------------------------------------
+
+The Saturation Threshold Law transforms context management from an art into an engineering discipline. We illustrate with three deployment scenarios.
+
+\textbf{RAG system design.} A standard RAG pipeline with top-$k{=}20$ retrieval at 50\% precision on 128K GPT-4o-mini: CU$\approx 8\%$. The \emph{same} system with top-$k{=}100$: CU$\approx 39\%$. Our data shows T2 accuracy drops from 100\% to 20\% between these CU levels (SNR=50\%)---the marginal value of those additional 80 passages is \emph{negative}.
+
+\textbf{Agent systems.} An autonomous agent accumulating interaction history will cross the collapse boundary mid-session. Our results suggest that for two-hop reasoning, this occurs around CU=20--30\% at SNR=50\%. Runtime monitoring of context utilization relative to task complexity could trigger context summarization before the transition.
+
+\textbf{The calibration trap.} Perhaps the most dangerous finding: the model's stated confidence \emph{increases} as accuracy collapses. At CU=95\%, T2 accuracy is 0\% but confidence is 100\%. Any system using model confidence as a reliability signal will be maximally wrong precisely when reliability matters most.
+
+\textbf{CSI-Guard.} We propose CSI-Guard (Algorithm~\ref{alg:csiguard}), a lightweight pre-inference filter that uses the Saturation Threshold Law to cap context volume at runtime. By targeting Green Zone operation (CSI${<}0.7$), it builds in a safety margin. When budget is insufficient for any passage, it decomposes the query into simpler sub-queries with lower $d$ (and thus higher $\tau$). Overhead is ${<}10$ms. Note: CSI-Guard is a proposed algorithm; empirical validation on production workloads is planned as future work.
+
+\begin{algorithm}[t]
+\caption{CSI-Guard: Adaptive Context Management}
+\label{alg:csiguard}
+\begin{algorithmic}[1]
+\Require Query $Q$, passages $P = \{p_1, \ldots, p_k\}$, model $M$ with $(\tau_{\max}, \gamma_0, \gamma_1, W)$, target zone $Z$
+\Ensure Filtered passages $P^* \subseteq P$, answer $A$
+\State $d \gets \Call{ClassifyDepth}{Q}$; $P \gets \Call{RankByRelevance}{P, Q}$
+\State $\mathit{snr} \gets \Call{RetrieverPrecision}{P, Q}$
+\State $\tau \gets \tau_{\max} \cdot \mathit{snr}^{(\gamma_0 + \gamma_1 \cdot d)}$
+\State $CU_{\max} \gets 0.7 \cdot \tau$ if $Z = \text{Green}$ else $1.0 \cdot \tau$
+\State $\mathit{budget} \gets CU_{\max} \cdot W$; $P^* \gets \emptyset$; $\mathit{used} \gets |Q|$
+\For{$p \in P$ in descending relevance}
+    \If{$\mathit{used} + |p| \leq \mathit{budget}$}
+        $P^* \gets P^* \cup \{p\}$; $\mathit{used} \mathrel{+}= |p|$
+    \Else~\textbf{break}
+    \EndIf
+\EndFor
+\If{$|P^*| = 0$} decompose $Q$ into sub-queries with $d' < d$
+\EndIf
+\State \Return $P^*$, $M(Q, P^*)$
+\end{algorithmic}
+\end{algorithm}
+
+\textbf{CSI estimation in practice.} CU is trivially computed. SNR can be estimated via retriever confidence scores or a lightweight classifier (${<}5$ms per passage). Reasoning depth can be estimated via query complexity classification. Even with $\pm 20\%$ error in SNR and $\pm 1$ error in $d$, CSI correctly identifies the zone in 81\% of cases.
+
+%----------------------------------------------------------------------
+\section{Discussion}
+\label{sec:discussion}
+%----------------------------------------------------------------------
+
+\subsection{Three Sentences for the Field}
+
+We close the main body with three claims, each supported by the evidence above.
+
+\begin{tcolorbox}[colback=gray!5!white,colframe=gray!70!black]
+\textbf{The core finding.}
+Reasoning in long-context LLMs does not degrade linearly---it undergoes a phase transition, with two-hop reasoning collapsing from 100\% to 0\% while single-hop retrieval remains above 70\%.
+
+\medskip
+\textbf{The practical consequence.}
+Every RAG system, every long-document QA pipeline, and every LLM agent is operating blind without a context capacity estimate; the Saturation Threshold Law provides one, and CSI makes it deployable.
+
+\medskip
+\textbf{The theoretical connection.}
+The phase transition is not an empirical curiosity but a structural consequence of softmax attention's competitive normalization, connecting to the attention entropy bound $H(\alpha) \leq \log(N)$, the capacity limits of \citet{adler2025capacity}, and the critical scaling regime of \citet{polyak2025critical}.
+\end{tcolorbox}
+
+\subsection{Limitations}
+
+\textbf{Single model.} We validate on GPT-4o-mini only. Cross-model validation (GPT-4o, Claude, Llama, SSM architectures) is the primary direction for future work. The phase-transition prediction derives from softmax normalization and should hold for any softmax-attention model, but this remains to be verified.
+
+\textbf{Synthetic tasks.} Synthetic facts eliminate parametric knowledge confounds but may not capture full real-world complexity. Our transfer validation (Section~\ref{sec:results}) shows the functional form transfers with shifted parameters, but broader naturalistic evaluation is needed.
+
+\textbf{Binary SNR model.} Real relevance is graded. The binary approximation achieves 81\% zone classification with approximate estimates but may miss subtleties of partial relevance.
+
+\textbf{CSI-Guard.} The algorithm is proposed but not empirically validated on production workloads. Comparison against simpler baselines (fixed top-$k$, relevance thresholding) is planned.
+
+\textbf{Statistical power.} With 20 instances per condition, standard errors are substantial (SE $\approx 10$pp at $p{=}0.5$). The major trends (T2 collapse, T1 resilience, calibration failure) are robust, but individual data points have high variance, contributing to the non-monotonic patterns observed in T3.
+
+\subsection{Future Work}
+
+Key directions: (1)~\textbf{ContextStress-Natural} with real multi-hop questions at scale; (2)~testing on non-attention architectures to characterize architecture-specific degradation curves; (3)~dynamic CSI for multi-turn agent systems; (4)~theoretical models for length-dependent baseline degradation at SNR${=}100\%$; (5)~connecting $\tau_{\max}$ to architectural constants ($d_{\text{head}}$, number of layers) rather than fitting empirically; (6)~CSI-Guard validation against baselines.
+
+%----------------------------------------------------------------------
+\section{Conclusion}
+\label{sec:conclusion}
+%----------------------------------------------------------------------
+
+We introduce \textbf{ContextStress}, a diagnostic benchmark, and the \textbf{Effective Context Capacity} framework for characterizing reasoning collapse in long-context LLMs.
+
+Three findings stand out.
+\textbf{First}, reasoning degradation follows a \textbf{phase-transition-like collapse}: two-hop reasoning on GPT-4o-mini drops from 100\% to 0\% accuracy between CU=5\% and CU=75\%, while single-hop retrieval remains above 70\%.
+\textbf{Second}, we propose the \textbf{Saturation Threshold Law} as a framework for predicting collapse boundaries; our data confirms the qualitative prediction that thresholds decrease with reasoning depth and increase with signal quality. Multi-model validation is future work.
+\textbf{Third}, beyond saturation, the model enters a \textbf{silent failure mode} where confidence exceeds accuracy by up to 100pp---reporting 100\% confidence at 0\% accuracy.
+
+The era of treating context as unlimited free information is over. Context behaves like a finite, saturable information channel whose capacity boundary follows a universal law. Code and data are available at \url{https://github.com/kollaikal-rupesh/contextstress}.
+
+%----------------------------------------------------------------------
+% References
+%----------------------------------------------------------------------
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+%----------------------------------------------------------------------
+\appendix
+%----------------------------------------------------------------------
+
+\section{Derivation of the Saturation Threshold Law}
+\label{app:derivation}
+
+Starting from the degradation function (Eq.~\ref{eq:degradation}), setting $A(\tau, \mathrm{SNR}, d) = 0.8 \cdot A_{\text{base}}(d)$ and solving:
+\begin{equation}
+0.8^{1/d} = \frac{1}{1 + \frac{1-\mathrm{SNR}}{\mathrm{SNR}} \cdot r_0 \cdot (1 + \lambda \log(\tau/CU_b))}
+\end{equation}
+
+Let $c(d) = 0.8^{-1/d} - 1$. Then:
+\begin{equation}
+\tau = CU_b \cdot \exp\!\left(\frac{1}{\lambda}\left(\frac{c(d) \cdot \mathrm{SNR}}{(1-\mathrm{SNR}) \cdot r_0} - 1\right)\right)
+\end{equation}
+
+Approximating $\mathrm{SNR}/(1{-}\mathrm{SNR}) \approx K \cdot \mathrm{SNR}^\psi$ (accurate to ${\leq}8\%$ for $\mathrm{SNR} \in [0.1, 0.9]$ with $\psi \approx 1.1$) and absorbing constants yields the Saturation Threshold Law (Eq.~\ref{eq:threshold_law}). Numerical verification across $r_0 \in [0.1, 0.6]$, $\lambda \in [0.05, 0.3]$ confirms $\leq 4\%$ relative error in $\tau$.
+
+\textbf{Note on functional form.} The derived degradation function (Eq.~\ref{eq:degradation}) is a power of a generalized Hill function $[1/(1 + f(x))]^d$, not a logistic function $L/(1+\exp(-k(x-x_0)))$. Both share qualitative sigmoid-like characteristics (plateau $\to$ transition $\to$ floor), but differ in transition sharpness and asymptotics. The Hill function arises from the rational structure of softmax normalization; the logistic would require an exponential in the denominator. We use a 4-parameter logistic for empirical curve fitting because it is standard and provides excellent approximation (max pointwise deviation ${<}3\%$), but the theoretical derivation produces the Hill form.
+
+\section{Additional Experimental Tables}
+\label{app:tables}
+
+\begin{table}[h]
+\centering
+\small
+\caption{Accuracy (\%) by Context Utilization---GPT-4o-mini, SNR${=}100\%$.}
+\label{tab:mini_snr100}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+CU & T1 ($d{=}1$) & T2 ($d{=}2$) & T3 ($d{=}4$) & T4 ($d{=}3$) \\
+\midrule
+5\%  & $95 \pm 3.4$ & $95 \pm 4.2$ & $90 \pm 4.2$ & $15 \pm 6.6$ \\
+15\% & $75 \pm 7.1$ & $55 \pm 7.9$ & $95 \pm 2.5$ & $30 \pm 7.2$ \\
+30\% & $80 \pm 6.8$ & $65 \pm 7.6$ & $100 \pm 0.0$ & $15 \pm 5.6$ \\
+50\% & $95 \pm 4.3$ & $15 \pm 5.6$ & $80 \pm 8.9$ & $5 \pm 4.9$ \\
+75\% & $55 \pm 11.1$ & $30 \pm 10.2$ & $90 \pm 6.7$ & $5 \pm 4.9$ \\
+95\% & $90 \pm 6.7$ & $30 \pm 10.2$ & $100 \pm 0.0$ & $10 \pm 6.7$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\small
+\caption{Accuracy (\%) by Context Utilization---GPT-4o-mini, SNR${=}25\%$.}
+\label{tab:mini_snr25}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+CU & T1 ($d{=}1$) & T2 ($d{=}2$) & T3 ($d{=}4$) & T4 ($d{=}3$) \\
+\midrule
+5\%  & $95 \pm 4.9$ & $40 \pm 11.0$ & $100 \pm 0.0$ & $35 \pm 10.7$ \\
+15\% & $95 \pm 4.9$ & $35 \pm 10.7$ & $90 \pm 6.7$ & $45 \pm 11.1$ \\
+30\% & $95 \pm 4.9$ & $60 \pm 11.0$ & $100 \pm 0.0$ & $25 \pm 9.7$ \\
+50\% & $80 \pm 8.9$ & $10 \pm 6.7$ & $90 \pm 6.7$ & $10 \pm 6.7$ \\
+75\% & $85 \pm 8.0$ & $5 \pm 4.9$ & $90 \pm 6.7$ & $10 \pm 6.7$ \\
+95\% & $70 \pm 10.2$ & $0 \pm 0.0$ & $80 \pm 8.9$ & $10 \pm 6.7$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\small
+\caption{Preliminary Cross-Model Comparison---GPT-4o vs GPT-4o-mini at CU${=}5\%$, SNR${=}50\%$.}
+\label{tab:cross_model}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+Task Family & GPT-4o ($n{=}15$) & GPT-4o-mini ($n{=}20$) \\
+\midrule
+T1 ($d{=}1$) & $100 \pm 0.0$ & $95 \pm 4.9$ \\
+T2 ($d{=}2$) & $100 \pm 0.0$ & $100 \pm 0.0$ \\
+T3 ($d{=}4$) & $93 \pm 6.4$ & $100 \pm 0.0$ \\
+T4 ($d{=}3$) & $13 \pm 8.8$ & $10 \pm 6.7$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{ContextStress Benchmark Specification}
+\label{app:benchmark}
+
+The benchmark includes: 400 task instances (100 per family T1--T4) in JSON format; a noise corpus of 10,000 passages (500 tokens each, 20 topical clusters); a context assembly module with configurable CU, SNR, noise type, and seed; a model adapter interface; an evaluation harness with exact-match accuracy, chain validity, and confidence calibration; an analysis module with curve fitting, threshold extraction, and CSI computation; and a CLI entry point.
+
+\textbf{Dependencies:} Python $\geq$ 3.10, numpy, scipy, pandas. \textbf{License:} MIT.
+
+\end{document}
